@@ -67,9 +67,13 @@ Ensure the matching Termux libpython can be found by the dynamic linker. For a
 privately extracted interpreter, use a process-local library search path; do not
 replace the device's system Python or preload a different Python minor.
 
-The local prototype passed all 12 actual parse variants (including TSX and both
-PHP variants) in a fresh private CPython 3.14.10 venv, with no LD_PRELOAD. This is
-**not** a test of language-pack or the complete OpenViking service.
+Both the local prototype and the real hosted-NDK artifacts passed all 12 actual
+parse variants (including TSX and both PHP variants) in a fresh private CPython
+3.14.10 venv, with no LD_PRELOAD. Hosted run:
+https://github.com/nexw/openviking-android-prebuild-verify/actions/runs/44020777022
+The downloaded artifact's SHA256SUMS were verified before offline binary-only
+installation and device tests. This is **not** a test of language-pack or the
+complete OpenViking service.
 
 ## Stage 2: language-pack and the remaining binary closure
 
@@ -105,7 +109,19 @@ The first prototype should preserve its real API and build a bounded grammar
 set into the extension with upstream `TSLP_LINK_MODE=static` and an explicit
 `TSLP_LANGUAGES` list. Pin and verify upstream's parser source bundle, use a local
 source URL, disable downloads, and test both supported and unsupported languages
-offline. This stage has not yet passed an Android build/runtime acceptance test.
+offline. The opt-in `Android Offline Language Pack` workflow prototypes this
+stage. It uses exact source/grammar hashes, an explicit embedded set, and Cargo
+features that remove both the runtime downloader and dynamic grammar loading.
+Its real `process()` and offline `prefetch()` implementations remain upstream
+code; download/cache/configuration APIs explicitly raise errors rather than
+pretend to succeed. OpenViking's optional cache-configuration call already
+handles that error. Unsupported languages must also fail promptly.
+
+Initial verification can explicitly resolve and archive the Cargo workspace
+lockfile (`--resolve-lock`); repeatable builds must reuse its verified
+`--cargo-lock` input. Source grammar notices and resolved Rust dependency notices
+are included inside the wheel. This stage has not yet passed an Android
+build/runtime acceptance test.
 
 ## Full-distribution acceptance criteria
 
