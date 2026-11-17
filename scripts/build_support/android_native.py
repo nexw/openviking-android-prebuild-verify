@@ -7,10 +7,10 @@ The three artifacts below are the ones ``setup.py`` normally produces locally
 * ``openviking/lib/ragfs_python.abi3.so``               - PyO3 RAGFS binding
 * ``openviking/storage/vectordb/engine/_native.abi3.so`` - C++ vectordb engine
 
-All of them are stable-ABI (``Py_LIMITED_API`` >= 3.10) so one build serves every
-CPython Termux ships, but they must be linked against bionic - a manylinux build
-is rejected by Android's linker. ``verify`` enforces exactly that, which is what
-makes a cross-built bundle safe to publish.
+The extensions use the stable API (``Py_LIMITED_API`` >= 3.10), but these Android
+builds link Termux's versioned libpython and require that CPython minor version
+on the device. The CLI is static musl; the extensions must use bionic rather than
+glibc. ``verify`` checks ELF structure and dependencies, not runtime imports.
 
 Typical CI usage::
 
@@ -336,18 +336,19 @@ def wheel_check(dist: Path) -> list[str]:
                         f"{name}: missing wheel members {missing}; wheel has {sorted(members)}"
                     )
             elif name.startswith(WHEEL_MODULE_PREFIX):
-                # maturin's exact extension name is its own business; any
-                # top-level ragfs_python*.so is the module.
+                # maturin supports both a top-level extension and a package
+                # containing __init__.py plus ragfs_python/ragfs_python.abi3.so.
                 required = [
                     member
                     for member in members
-                    if "/" not in member
-                    and member.startswith("ragfs_python")
+                    if Path(member).parent.as_posix() in (".", "ragfs_python")
+                    and Path(member).name.startswith("ragfs_python.")
                     and member.endswith(".so")
                 ]
                 if not required:
                     raise VerificationError(
-                        f"{name}: no top-level ragfs_python*.so; wheel has {sorted(members)}"
+                        f"{name}: no ragfs_python extension at the wheel root or in "
+                        f"ragfs_python/; wheel has {sorted(members)}"
                     )
             else:
                 required = []
