@@ -1,0 +1,769 @@
+name: 15. _Build Distribution
+
+on:
+  workflow_call:
+    inputs:
+      os_json:
+        description: 'JSON string of runner labels to build on (ubuntu-24.04=x86_64, ubuntu-24.04-arm=aarch64, macos-15=arm64, macos-15-intel=x86_64, windows-latest=x86_64)'
+        required: false
+        type: string
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-latest"]'
+      python_json:
+        description: 'JSON string of Python versions'
+        required: false
+        type: string
+        default: '["3.10"]'
+      build_sdist:
+        description: 'Whether to build source distribution'
+        required: false
+        type: boolean
+        default: true
+      build_wheels:
+        description: 'Whether to build wheel distribution'
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      check_linux_runner:
+        description: 'Check Docker and HTTPS package downloads on the dedicated Linux build runner'
+        required: false
+        type: boolean
+        default: false
+      build_sdist:
+        description: 'Whether to build source distribution'
+        required: false
+        type: boolean
+        default: true
+      build_wheels:
+        description: 'Whether to build wheel distribution'
+        required: false
+        type: boolean
+        default: true
+      os_json:
+        description: 'JSON string of runner labels to build on (ubuntu-24.04=x86_64, ubuntu-24.04-arm=aarch64, macos-15=arm64, macos-15-intel=x86_64, windows-latest=x86_64)'
+        required: false
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-latest"]'
+      python_json:
+        description: 'JSON string of Python versions'
+        required: false
+        default: '["3.10"]'
+
+jobs:
+  check-linux-runner:
+    name: Check dedicated Linux runner
+    if: github.event_name == 'workflow_dispatch' && inputs.check_linux_runner && github.repository == 'volcengine/OpenViking'
+    runs-on: [self-hosted, Linux, X64, ci-linux-builds]
+    permissions: {}
+    timeout-minutes: 5
+    env:
+      UBUNTU_MIRROR: ${{ vars.CI_UBUNTU_MIRROR }}
+    steps:
+      - name: Verify runner and disposable build containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          id
+          uname -m
+          nproc
+          df -h "$RUNNER_TEMP"
+          docker version
+          test -s /etc/ssl/certs/ca-certificates.crt
+          for host in archive.ubuntu.com mirrors.aliyun.com; do
+            if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/443' _ "$host"; then
+              echo "Host TCP reachable: $host:443"
+            else
+              echo "Host TCP unreachable: $host:443"
+            fi
+            if docker run --rm ubuntu:24.04 timeout 5 \
+              bash -c 'exec 3<>/dev/tcp/$1/443' _ "$host"; then
+              echo "Container TCP reachable: $host:443"
+            else
+              echo "Container TCP unreachable: $host:443"
+            fi
+          done
+          for image in ubuntu:20.04 ubuntu:24.04; do
+            docker run --rm -i \
+              --env UBUNTU_MIRROR \
+              --volume /etc/ssl/certs/ca-certificates.crt:/tmp/runner-ca-certificates.crt:ro \
+              "$image" bash -e <<'BOOTSTRAP'
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$source" ]; then
+              sed -i 's|http://|https://|g' "$source"
+              if [ -n "$UBUNTU_MIRROR" ]; then
+                case "$UBUNTU_MIRROR" in https://*) ;; *) exit 1 ;; esac
+                sed -i \
+                  "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR%/}|g; s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR%/}|g" \
+                  "$source"
+              fi
+            fi
+          done
+          apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
+            -o Acquire::Retries=2 -o Acquire::https::Timeout=20 \
+            -o APT::Update::Error-Mode=any update
+          apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
+            -o Acquire::Retries=2 install -y ca-certificates git
+          getconf GNU_LIBC_VERSION
+          BOOTSTRAP
+          done
+
+  build-studio:
+    name: Build shared Studio bundle
+    if: inputs.build_wheels
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: web-studio/package-lock.json
+    - name: Build Studio
+      working-directory: web-studio
+      run: |
+        npm ci
+        npm run build -- --base=/studio/
+        test -f dist/index.html
+    - uses: actions/upload-artifact@v7
+      with:
+        name: studio-bundle-${{ github.sha }}
+        path: web-studio/dist/
+        if-no-files-found: error
+
+  build-sdist:
+    name: Build source distribution py3.12
+    if: inputs.build_sdist
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 0  # Required for setuptools_scm to detect version from git tags
+
+    - name: Fetch all tags
+      run: git fetch --force --tags
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Create venv
+      run: uv venv
+
+    - name: Install build dependencies
+      run: uv pip install build setuptools_scm
+
+    - name: Clean workspace (force ignore dirty)
+      shell: bash
+      run: |
+        git reset --hard HEAD
+        git clean -fd
+        # For sdist, ensure local runtime binaries are not packaged even if present
+        # Ignore uv.lock changes to avoid dirty state in setuptools_scm
+        git update-index --assume-unchanged uv.lock || true
+
+    - name: Debug Git and SCM
+      shell: bash
+      run: |
+        echo "=== Git Describe ==="
+        git describe --tags --long --dirty --always
+        echo "=== Setuptools SCM Version ==="
+        uv run --no-sync python -m setuptools_scm
+        echo "=== Git Status (Ignored included) ==="
+        git status --ignored
+        echo "=== Check openviking/_version.py ==="
+        if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
+
+    - name: Build sdist
+      run: uv build --sdist
+
+    - name: Store the distribution packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: python-package-distributions-sdist
+        path: dist/*.tar.gz
+
+    - name: Display built sdist version
+      continue-on-error: true
+      run: |
+        VERSION=$(ls dist/*.tar.gz | head -n 1 | xargs basename | sed -E 's/^[^-]+-(.+)\.tar\.gz$/\1/')
+        echo "Build Version: $VERSION"
+        echo "::notice::Build sdist Version: $VERSION"
+
+  build-linux:
+    needs: build-studio
+    name: Build distribution on Linux ${{ matrix.arch }} (glibc 2.31) py${{ matrix.python-version }}
+    # Run if Linux runners are requested (explicit labels or generic 'linux')
+    if: >-
+      inputs.build_wheels &&
+      (
+        contains(inputs.os_json, 'linux') ||
+        contains(inputs.os_json, '"ubuntu-24.04"') ||
+        contains(inputs.os_json, 'ubuntu-24.04-arm')
+      )
+    runs-on: >-
+      ${{ fromJSON(matrix.arch == 'aarch64' && '["ubuntu-24.04-arm"]' ||
+          github.repository == 'volcengine/OpenViking' &&
+          (github.event_name == 'pull_request' || github.event_name == 'push') &&
+          !startsWith(github.ref, 'refs/tags/') && vars.CI_DISABLE_SELF_HOSTED != 'true' &&
+          vars.CI_LINUX_BUILDS_ENABLED == 'true' &&
+          (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) &&
+          (endsWith(github.run_number, '0') || endsWith(github.run_number, '2') ||
+           endsWith(github.run_number, '4') || endsWith(github.run_number, '6') ||
+           endsWith(github.run_number, '8')) &&
+          '["self-hosted","Linux","X64","ci-linux-builds"]' || '["ubuntu-24.04"]') }}
+    container:
+      image: ubuntu:20.04
+      # Minimal Ubuntu images lack CA certificates before the first apt install.
+      options: --volume /etc/ssl/certs/ca-certificates.crt:/tmp/runner-ca-certificates.crt:ro
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Etc/UTC
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(inputs.python_json) }}
+        arch: ${{ contains(inputs.os_json, 'linux') && fromJson('["x86_64","aarch64"]') || (contains(inputs.os_json, '"ubuntu-24.04"') && contains(inputs.os_json, 'ubuntu-24.04-arm')) && fromJson('["x86_64","aarch64"]') || contains(inputs.os_json, 'ubuntu-24.04-arm') && fromJson('["aarch64"]') || fromJson('["x86_64"]') }}
+    
+    steps:
+    - name: Install system dependencies (Linux)
+      env:
+        UBUNTU_MIRROR: ${{ runner.environment == 'self-hosted' && vars.CI_UBUNTU_MIRROR || '' }}
+      run: |
+        sed -i 's|http://|https://|g' /etc/apt/sources.list
+        if [ -n "$UBUNTU_MIRROR" ]; then
+          case "$UBUNTU_MIRROR" in https://*) ;; *) exit 1 ;; esac
+          sed -i \
+            "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR%/}|g; s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR%/}|g" \
+            /etc/apt/sources.list
+        fi
+        apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
+          -o Acquire::Retries=2 -o Acquire::https::Timeout=20 \
+          -o APT::Update::Error-Mode=any update
+        apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
+          -o Acquire::Retries=2 -o Acquire::https::Timeout=20 install -y --no-install-recommends \
+          git ca-certificates cmake build-essential clang tzdata curl \
+          pkg-config unzip xz-utils python3 libicu66 \
+          libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+          libffi-dev liblzma-dev libgdbm-dev libnss3-dev libncurses5-dev \
+          libncursesw5-dev tk-dev uuid-dev libexpat1-dev
+        ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime
+        dpkg-reconfigure -f noninteractive tzdata
+
+    - name: Select compiler toolchain (Linux)
+      run: |
+        echo "CC=clang" >> "$GITHUB_ENV"
+        echo "CXX=clang++" >> "$GITHUB_ENV"
+        echo "OV_REQUIRE_RAGFS_BUILD=1" >> "$GITHUB_ENV"
+        clang --version
+        clang++ --version
+
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 0  # Required for setuptools_scm to detect version from git tags
+
+    - uses: ./.github/actions/linux-test-env
+
+    - name: Fetch all tags
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        git fetch --force --tags
+
+    - name: Build CPython (Dynamic Selection)
+      run: |
+        # Map short version to full version for our specific build environment
+        PYTHON_VERSION="${{ matrix.python-version }}"
+        case "$PYTHON_VERSION" in
+          "3.9") PYTHON_FULL="3.9.18" ;;
+          "3.10") PYTHON_FULL="3.10.13" ;;
+          "3.11") PYTHON_FULL="3.11.8" ;;
+          "3.12") PYTHON_FULL="3.12.2" ;;
+          "3.13") PYTHON_FULL="3.13.2" ;;
+          "3.14") PYTHON_FULL="3.14.3" ;;
+          *)
+            echo "Error: Unknown python version $PYTHON_VERSION"
+            exit 1
+            ;;
+        esac
+        
+        PYTHON_PREFIX="/opt/python/${PYTHON_FULL}"
+        PYTHON_BIN="${PYTHON_PREFIX}/bin/python${{ matrix.python-version }}"
+        if [ ! -x "$PYTHON_BIN" ]; then
+          curl -fsSL -o /tmp/Python-${PYTHON_FULL}.tgz \
+            https://www.python.org/ftp/python/${PYTHON_FULL}/Python-${PYTHON_FULL}.tgz
+          tar -xzf /tmp/Python-${PYTHON_FULL}.tgz -C /tmp
+          cd /tmp/Python-${PYTHON_FULL}
+          CFLAGS="-fPIC" \
+          ./configure --prefix="${PYTHON_PREFIX}" --with-ensurepip=install --enable-shared
+          make -j"$(nproc)"
+          make install
+        fi
+        echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}"
+        "$PYTHON_BIN" -V
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: stable
+        targets: ${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+    - uses: ./.github/actions/compiler-cache
+      with:
+        target: ${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+
+    - name: Create venv (Linux)
+      run: uv venv --python "$PYTHON_BIN"
+
+    - name: Seed pip (Linux)
+      run: .venv/bin/python -m ensurepip --upgrade
+
+    - name: Install build dependencies
+      run: uv pip install setuptools setuptools_scm cmake wheel build
+
+    - name: Resolve OpenViking version for Rust CLI (Linux)
+      shell: bash
+      run: |
+        OPENVIKING_VERSION=$(
+          exact_tag=$(git describe --tags --exact-match "$GITHUB_SHA" 2>/dev/null || true)
+          if [[ "$exact_tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            printf '%s\n' "${exact_tag#v}"
+          else
+            rm -f openviking/_version.py
+            rm -rf openviking.egg-info
+            env -u OPENVIKING_VERSION -u SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING uv run --no-sync python -c "from scripts.build_support.versioning import resolve_openviking_version; print(resolve_openviking_version())"
+          fi
+        )
+        echo "OPENVIKING_VERSION=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "Resolved OpenViking version: $OPENVIKING_VERSION"
+
+    - name: Build Rust CLI (Linux)
+      run: cargo build --release --target ${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }} -p ov_cli
+
+    - name: Copy Rust CLI binary (Linux)
+      run: |
+        mkdir -p openviking/bin
+        cp target/${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}/release/ov openviking/bin/
+        chmod +x openviking/bin/ov
+
+    - name: Clean workspace (force ignore dirty)
+      shell: bash
+      run: |
+        # Back up pre-built artifacts before cleaning
+        cp -a openviking/bin /tmp/_ov_bin || true
+        git reset --hard HEAD
+        git clean -fd
+        rm -rf openviking/_version.py openviking.egg-info
+        # Restore pre-built artifacts
+        cp -a /tmp/_ov_bin openviking/bin || true
+        # Ignore uv.lock changes to avoid dirty state in setuptools_scm
+        git update-index --assume-unchanged uv.lock || true
+
+    - name: Debug Git and SCM
+      shell: bash
+      run: |
+        echo "=== Git Describe ==="
+        git describe --tags --long --dirty --always
+        echo "=== Setuptools SCM Version ==="
+        uv run --no-sync python -m setuptools_scm
+        echo "=== Git Status (Ignored included) ==="
+        git status --ignored
+        echo "=== Check openviking/_version.py ==="
+        if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
+        echo "=== Verify pre-built artifacts survived clean ==="
+        ls -la openviking/bin/ || true
+
+    - name: Restore shared Studio bundle
+      uses: actions/download-artifact@v8
+      with:
+        name: studio-bundle-${{ github.sha }}
+        path: openviking/web_studio/dist/
+
+    - name: Build package (Wheel Only)
+      env:
+        OV_SKIP_OV_BUILD: '1'
+      run: uv build --wheel
+
+    - name: Check bundled ov version matches wheel
+      shell: bash
+      run: |
+        WHEEL_VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
+        if [[ "$WHEEL_VERSION" != "$OPENVIKING_VERSION" ]]; then
+          echo "::error::ov binary was built as $OPENVIKING_VERSION but the wheel is $WHEEL_VERSION"
+          exit 1
+        fi
+        echo "ov binary and wheel both use $WHEEL_VERSION"
+
+    - name: Install patchelf (Linux)
+      run: |
+        PATCHELF_VERSION=0.18.0
+        curl -fsSL -o /tmp/patchelf-${PATCHELF_VERSION}.tar.gz \
+          https://github.com/NixOS/patchelf/releases/download/${PATCHELF_VERSION}/patchelf-${PATCHELF_VERSION}.tar.gz
+        tar -xzf /tmp/patchelf-${PATCHELF_VERSION}.tar.gz -C /tmp
+        cd /tmp/patchelf-${PATCHELF_VERSION}
+        ./configure
+        make -j"$(nproc)"
+        make install
+        patchelf --version
+
+    - name: Repair wheels (Linux)
+      run: |
+        uv pip install auditwheel
+        uv run --no-sync auditwheel repair dist/*.whl -w dist_fixed
+        rm dist/*.whl
+        mv dist_fixed/*.whl dist/
+        rmdir dist_fixed
+
+    - name: Smoke test built wheel (Linux)
+      shell: bash
+      run: |
+        "$PYTHON_BIN" -m pip install --upgrade pip
+        "$PYTHON_BIN" -m pip install --force-reinstall dist/*.whl
+
+        cd "$RUNNER_TEMP"
+        "$PYTHON_BIN" - <<'PY'
+        import importlib
+        import importlib.util
+        from importlib.resources import files
+
+        from openviking.pyagfs import get_binding_client
+        import openviking.storage.vectordb.engine as engine
+
+        if importlib.util.find_spec("openviking.integrations") is not None:
+            raise SystemExit("Server wheel must not ship the removed framework namespace")
+
+        binding_client, _ = get_binding_client()
+        if binding_client is None:
+            raise SystemExit("ragfs binding client was not installed")
+
+        print(f"Loaded RAGFS binding client {binding_client.__name__}")
+        print(f"Loaded runtime engine variant {engine.ENGINE_VARIANT}")
+        print(f"Available engine variants {engine.AVAILABLE_ENGINE_VARIANTS}")
+
+        module_name = f"openviking.storage.vectordb.engine._{engine.ENGINE_VARIANT}"
+        backend_spec = importlib.util.find_spec(module_name)
+        if backend_spec is None or backend_spec.origin is None:
+            raise SystemExit(f"backend module {module_name} was not installed")
+
+        backend = importlib.import_module(module_name)
+        required_filter_symbols = (
+            "_index_engine_set_filter_layout",
+            "_index_engine_evaluate_filter",
+            "_index_engine_evaluate_filter_cached",
+            "_index_engine_search_with_filter_token",
+        )
+        missing_filter_symbols = [
+            symbol for symbol in required_filter_symbols if not hasattr(backend, symbol)
+        ]
+        if missing_filter_symbols:
+            raise SystemExit(
+                f"backend module {module_name} is missing filter ABI symbols: "
+                f"{', '.join(missing_filter_symbols)}"
+            )
+
+        required_filter_methods = (
+            "set_filter_layout",
+            "evaluate_filter",
+            "search_with_filter_token",
+        )
+        missing_filter_methods = [
+            method for method in required_filter_methods if not hasattr(engine.IndexEngine, method)
+        ]
+        if missing_filter_methods:
+            raise SystemExit(
+                "IndexEngine is missing filter methods: "
+                f"{', '.join(missing_filter_methods)}"
+            )
+
+        studio_index = files("openviking").joinpath("web_studio/dist/index.html")
+        if not studio_index.is_file():
+            raise SystemExit("Web Studio index.html was not installed")
+
+        print(f"Imported backend module {module_name}")
+        print(f"Backend module origin {backend_spec.origin}")
+        print(f"Validated filter ABI symbols {required_filter_symbols}")
+        print(f"Bundled Web Studio index {studio_index}")
+        PY
+
+    - name: Store the distribution packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: python-package-distributions-linux-${{ matrix.arch }}-${{ matrix.python-version }}
+        path: dist/
+
+    - name: Display built wheel version
+      continue-on-error: true
+      run: |
+        VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
+        echo "Build Version: $VERSION"
+        echo "::notice::Build Wheel Version (Linux ${{ matrix.arch }} glibc 2.31 py${{ matrix.python-version }}): $VERSION"
+
+  build-other:
+    needs: build-studio
+    name: Build non-Linux distributions
+    # Run only when non-Linux runners are explicitly requested
+    if: inputs.build_wheels && (contains(inputs.os_json, 'macos') || contains(inputs.os_json, 'windows'))
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(inputs.os_json) }}
+        python-version: ${{ fromJson(inputs.python_json) }}
+        # Exclude ubuntu-24.04 from this matrix if it was passed in inputs
+        exclude:
+          - os: linux
+          - os: ubuntu-24.04
+          - os: ubuntu-24.04-arm
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 0  # Required for setuptools_scm to detect version from git tags
+
+    - name: Fetch all tags
+      run: git fetch --force --tags
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Configure macOS wheel architecture tag
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "macos-15" ]]; then
+          TARGET_ARCH="arm64"
+          MACOS_VERSION="14.0"
+        elif [[ "${{ matrix.os }}" == "macos-15-intel" ]]; then
+          TARGET_ARCH="x86_64"
+          MACOS_VERSION="15.0"
+        else
+          echo "Unsupported macOS runner for release wheels: ${{ matrix.os }}"
+          exit 1
+        fi
+
+        echo "MACOSX_DEPLOYMENT_TARGET=${MACOS_VERSION}" >> "$GITHUB_ENV"
+        echo "ARCHFLAGS=-arch ${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "CMAKE_OSX_ARCHITECTURES=${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "_PYTHON_HOST_PLATFORM=macosx-${MACOS_VERSION}-${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "Configured macOS wheel platform: macosx-${MACOS_VERSION}-${TARGET_ARCH}"
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: stable
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Install system dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install cmake
+
+    - name: Install system dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+        choco install mingw
+
+    - uses: ./.github/actions/compiler-cache
+      with:
+        target: ${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-msvc' || 'host' }}
+
+    - name: Create build environment without installing the project
+      run: uv venv
+
+    - name: Install build dependencies
+      run: uv pip install setuptools setuptools_scm cmake wheel build
+
+    - name: Require ragfs native artifact for wheel builds
+      shell: bash
+      run: echo "OV_REQUIRE_RAGFS_BUILD=1" >> "$GITHUB_ENV"
+
+    - name: Resolve OpenViking version for Rust CLI (macOS/Windows)
+      shell: bash
+      run: |
+        OPENVIKING_VERSION=$(
+          exact_tag=$(git describe --tags --exact-match "$GITHUB_SHA" 2>/dev/null || true)
+          if [[ "$exact_tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            printf '%s\n' "${exact_tag#v}"
+          else
+            rm -f openviking/_version.py
+            rm -rf openviking.egg-info
+            env -u OPENVIKING_VERSION -u SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING uv run --no-sync python -c "from scripts.build_support.versioning import resolve_openviking_version; print(resolve_openviking_version())"
+          fi
+        )
+        echo "OPENVIKING_VERSION=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "Resolved OpenViking version: $OPENVIKING_VERSION"
+
+    - name: Build Rust CLI (macOS/Windows)
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cargo build --release --target x86_64-pc-windows-msvc -p ov_cli
+        else
+          cargo build --release -p ov_cli
+        fi
+
+    - name: Copy Rust CLI binary (macOS/Windows)
+      shell: bash
+      run: |
+        mkdir -p openviking/bin
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cp target/x86_64-pc-windows-msvc/release/ov.exe openviking/bin/
+        else
+          cp target/release/ov openviking/bin/
+          chmod +x openviking/bin/ov
+        fi
+
+    - name: Clean workspace (force ignore dirty)
+      shell: bash
+      run: |
+        # Back up pre-built artifacts before cleaning
+        cp -a openviking/bin /tmp/_ov_bin || true
+        git reset --hard HEAD
+        git clean -fd
+        rm -rf openviking/_version.py openviking.egg-info
+        # Restore pre-built artifacts
+        cp -a /tmp/_ov_bin openviking/bin || true
+        # Ignore uv.lock changes to avoid dirty state in setuptools_scm
+        git update-index --assume-unchanged uv.lock || true
+
+    - name: Debug Git and SCM
+      shell: bash
+      run: |
+        echo "=== Git Describe ==="
+        git describe --tags --long --dirty --always
+        echo "=== Setuptools SCM Version ==="
+        uv run --no-sync python -m setuptools_scm
+        echo "=== Git Status (Ignored included) ==="
+        git status --ignored
+        echo "=== Check openviking/_version.py ==="
+        if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
+        echo "=== Verify pre-built artifacts survived clean ==="
+        ls -la openviking/bin/ || true
+
+    - name: Restore shared Studio bundle
+      uses: actions/download-artifact@v8
+      with:
+        name: studio-bundle-${{ github.sha }}
+        path: openviking/web_studio/dist/
+
+    - name: Build package (Wheel Only)
+      env:
+        OV_SKIP_OV_BUILD: '1'
+      run: uv build --wheel
+
+    - name: Check bundled ov version matches wheel
+      shell: bash
+      run: |
+        WHEEL_VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
+        if [[ "$WHEEL_VERSION" != "$OPENVIKING_VERSION" ]]; then
+          echo "::error::ov binary was built as $OPENVIKING_VERSION but the wheel is $WHEEL_VERSION"
+          exit 1
+        fi
+        echo "ov binary and wheel both use $WHEEL_VERSION"
+
+    - name: Smoke test built wheel (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --force-reinstall dist/*.whl
+
+        cd "$RUNNER_TEMP"
+        python - <<'PY'
+        import importlib.util
+        from importlib.resources import files
+
+        from openviking.pyagfs import get_binding_client
+        import openviking.storage.vectordb.engine as engine
+
+        if importlib.util.find_spec("openviking.integrations") is not None:
+            raise SystemExit("Server wheel must not ship the removed framework namespace")
+
+        binding_client, _ = get_binding_client()
+        if binding_client is None:
+            raise SystemExit("ragfs binding client was not installed")
+
+        print(f"Loaded RAGFS binding client {binding_client.__name__}")
+        print(f"Loaded runtime engine variant {engine.ENGINE_VARIANT}")
+        print(f"Available engine variants {engine.AVAILABLE_ENGINE_VARIANTS}")
+
+        module_name = f"openviking.storage.vectordb.engine._{engine.ENGINE_VARIANT}"
+        backend_spec = importlib.util.find_spec(module_name)
+        if backend_spec is None or backend_spec.origin is None:
+            raise SystemExit(f"backend module {module_name} was not installed")
+
+        studio_index = files("openviking").joinpath("web_studio/dist/index.html")
+        if not studio_index.is_file():
+            raise SystemExit("Web Studio index.html was not installed")
+
+        print(f"Imported backend module {module_name}")
+        print(f"Backend module origin {backend_spec.origin}")
+        print(f"Bundled Web Studio index {studio_index}")
+        PY
+
+    - name: Smoke test built wheel (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --force-reinstall dist/*.whl
+
+        cd "$RUNNER_TEMP"
+        python - <<'PY'
+        import importlib.util
+        from importlib.resources import files
+
+        import openviking.storage.vectordb.engine as engine
+
+        if importlib.util.find_spec("openviking.integrations") is not None:
+            raise SystemExit("Server wheel must not ship the removed framework namespace")
+
+        print(f"Loaded runtime engine variant {engine.ENGINE_VARIANT}")
+        print(f"Available engine variants {engine.AVAILABLE_ENGINE_VARIANTS}")
+
+        module_name = f"openviking.storage.vectordb.engine._{engine.ENGINE_VARIANT}"
+        backend_spec = importlib.util.find_spec(module_name)
+        if backend_spec is None or backend_spec.origin is None:
+            raise SystemExit(f"backend module {module_name} was not installed")
+
+        studio_index = files("openviking").joinpath("web_studio/dist/index.html")
+        if not studio_index.is_file():
+            raise SystemExit("Web Studio index.html was not installed")
+
+        print(f"Imported backend module {module_name}")
+        print(f"Backend module origin {backend_spec.origin}")
+        print(f"Bundled Web Studio index {studio_index}")
+        PY
+
+    - name: Store the distribution packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: python-package-distributions-${{ matrix.os == 'macos-15' && 'macos-arm64' || matrix.os == 'macos-15-intel' && 'macos-x86_64' || matrix.os == 'windows-latest' && 'windows-x86_64' || matrix.os }}-${{ matrix.python-version }}
+        path: dist/
+
+    - name: Display built wheel version
+      shell: bash
+      continue-on-error: true
+      run: |
+        VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
+        echo "Build Version: $VERSION"
+        echo "::notice::Build Wheel Version (${{ matrix.os == 'macos-15' && 'macOS arm64 (macos-15)' || matrix.os == 'macos-15-intel' && 'macOS x86_64 (macos-15-intel)' || matrix.os == 'windows-latest' && 'Windows x86_64 (windows-latest)' || matrix.os }} py${{ matrix.python-version }}): $VERSION"

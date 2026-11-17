@@ -1,0 +1,892 @@
+//! Primary filesystem wrapper that submits V2 multi-write metadata events.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use uuid::Uuid;
+
+use super::context::{FsContext, FS_CTX};
+use super::encryption_wrapper::EncryptionWrappedFS;
+use super::errors::{Error, Result};
+use super::filesystem::{normalize_prefix_path, FileSystem};
+use super::types::{
+    BackendRole, FileInfo, GlobPage, GrepOptions, GrepResult, ListSortBy, SortOrder, TreeEntry,
+    WriteFlag,
+};
+use crate::core::internal_names::{is_hidden_runtime_lock_name, is_multiwrite_internal_path};
+use crate::metrics::{RagfsMetric, RagfsMetricValue};
+use crate::multibackend::catch_up::CatchUpTarget;
+use crate::multibackend::constants::SYSTEM_DIR;
+use crate::multibackend::meta::{
+    current_required_ctx, DefaultFsContextResolver, FsContextResolver, MetadataStore,
+    MultiWriteMetricsSnapshot, MultiWriteWorker,
+};
+use crate::multibackend::migration::{FullDataImporter, ProtocolDetector};
+use crate::multibackend::model::{
+    PartitionsManifest, PendingEvent, PendingEventKind, ProtocolStatus, ScopeKey, SegmentEventType,
+    SegmentManifest,
+};
+use crate::multibackend::provider::{bootstrap_account, MultiWriteProvider};
+use crate::multibackend::runtime::{read_active_accounts, MultiWriteRuntime};
+
+const COPY_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// One configured primary or backup filesystem.
+pub struct BackendEntry {
+    /// Logical backend name.
+    pub name: String,
+    /// Backend role.
+    pub role: BackendRole,
+    /// Filesystem handle, including encryption when configured.
+    pub backend: Arc<dyn FileSystem>,
+    /// Optional raw filesystem handle.
+    pub raw_backend: Option<Arc<dyn FileSystem>>,
+}
+
+pub(crate) struct Inner {
+    primary: BackendEntry,
+    runtime: MultiWriteRuntime,
+    metrics: Arc<MultiWriteMetricsSnapshot>,
+    ctx_resolver: Arc<dyn FsContextResolver>,
+}
+
+/// Filesystem wrapper that commits primary operations before queuing V2 events.
+#[derive(Clone)]
+pub struct MultiWriteWrappedFS {
+    pub(crate) inner: Arc<Inner>,
+    metadata_store: Arc<MetadataStore>,
+}
+
+/// Builder for one V2 multi-write wrapper and its flush runtime.
+pub struct MultiWriteWrappedFSBuilder {
+    primary_backend: Arc<dyn FileSystem>,
+    primary_raw_backend: Option<Arc<dyn FileSystem>>,
+    backup_entries: Vec<BackendEntry>,
+    metadata_store: Option<Arc<MetadataStore>>,
+    metadata_provider: Option<Arc<dyn MultiWriteProvider>>,
+    initial_partitions: u32,
+    checkpoint_interval: Duration,
+    reconcile_existing_data: bool,
+    ctx_resolver: Arc<dyn FsContextResolver>,
+}
+
+impl MultiWriteWrappedFSBuilder {
+    /// Attach the raw primary backend used by internal operations and physical copies.
+    pub fn with_primary_raw_backend(mut self, primary_raw_backend: Arc<dyn FileSystem>) -> Self {
+        self.primary_raw_backend = Some(primary_raw_backend);
+        self
+    }
+
+    /// Attach configured backup handles for later catch-up workers.
+    pub fn with_backups(mut self, backup_entries: Vec<BackendEntry>) -> Self {
+        self.backup_entries = backup_entries;
+        self
+    }
+
+    /// Attach the metadata store used for account initialization and routing.
+    pub fn with_metadata_store(mut self, metadata_store: Arc<MetadataStore>) -> Self {
+        self.metadata_store = Some(metadata_store);
+        self
+    }
+
+    /// Attach the provider used by the background flush worker.
+    pub fn with_metadata_provider(
+        mut self,
+        metadata_provider: Arc<dyn MultiWriteProvider>,
+    ) -> Self {
+        self.metadata_provider = Some(metadata_provider);
+        self
+    }
+
+    /// Set the initial metadata partition count for newly observed accounts.
+    pub fn initial_partitions(mut self, initial_partitions: u32) -> Self {
+        self.initial_partitions = initial_partitions;
+        self
+    }
+
+    /// Set the interval between checkpoint discovery rounds.
+    pub fn checkpoint_interval(mut self, checkpoint_interval: Duration) -> Self {
+        self.checkpoint_interval = checkpoint_interval;
+        self
+    }
+
+    /// Set whether startup should reconcile existing primary data into V2 metadata.
+    pub fn reconcile_existing_data(mut self, reconcile_existing_data: bool) -> Self {
+        self.reconcile_existing_data = reconcile_existing_data;
+        self
+    }
+
+    /// Configure the resolver for mount-relative foreground paths.
+    pub fn ctx_resolver(mut self, ctx_resolver: Arc<dyn FsContextResolver>) -> Self {
+        self.ctx_resolver = ctx_resolver;
+        self
+    }
+
+    /// Build the wrapper after asynchronously starting its V2 runtime.
+    pub async fn build(self) -> Result<MultiWriteWrappedFS> {
+        let fs = self.build_inactive().await?;
+        fs.activate();
+        Ok(fs)
+    }
+
+    /// Build the wrapper while keeping its V2 runtime inactive.
+    pub(crate) async fn build_inactive(self) -> Result<MultiWriteWrappedFS> {
+        let metadata_store = self
+            .metadata_store
+            .ok_or_else(|| Error::config("multi-write metadata store is required"))?;
+        let metadata_provider = self
+            .metadata_provider
+            .ok_or_else(|| Error::config("multi-write metadata provider is required"))?;
+        let backup_names: Vec<String> = self
+            .backup_entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let configured_backups = backup_names.iter().cloned().collect::<BTreeSet<_>>();
+        let reset_import_pending = metadata_store.reset_import_pending().await?;
+        let existing_metadata = if reset_import_pending {
+            ExistingMetadataScan {
+                accounts: Vec::new(),
+                membership_changed: false,
+            }
+        } else {
+            scan_existing_metadata(metadata_store.as_ref(), &configured_backups).await?
+        };
+        let reset_for_backup_change = existing_metadata.membership_changed;
+        if reset_for_backup_change {
+            for account in &existing_metadata.accounts {
+                for (scope, _) in &account.segments {
+                    metadata_provider.reset_scope(scope).await?;
+                }
+            }
+            metadata_store.mark_reset_import_pending().await?;
+            metadata_store.reset_multiwrite_metadata().await?;
+            tracing::info!(
+                scopes = existing_metadata.scope_count(),
+                "multi-write backup membership changed; reset V2 metadata"
+            );
+        } else if reset_import_pending {
+            let scopes = reset_provider_scopes_for_current_accounts(
+                metadata_provider.as_ref(),
+                self.primary_backend.as_ref(),
+                self.initial_partitions,
+            )
+            .await?;
+            metadata_store.reset_multiwrite_metadata().await?;
+            tracing::info!(
+                scopes,
+                "multi-write backup reset import pending; reset V2 metadata"
+            );
+        }
+        let metrics = Arc::new(MultiWriteMetricsSnapshot::default());
+        let catch_up_targets = self
+            .backup_entries
+            .iter()
+            .map(|entry| CatchUpTarget {
+                backend_id: entry.name.clone(),
+                backend: entry.backend.clone(),
+            })
+            .collect();
+        let protocol = ProtocolDetector::new(metadata_store.clone())
+            .detect()
+            .await?;
+        metrics.set_protocol_status(protocol.status);
+        if !reset_for_backup_change {
+            for account_metadata in existing_metadata.accounts {
+                for (scope, segments) in &account_metadata.segments {
+                    segments.validate()?;
+                    metrics.replace_scope(scope, segments);
+                    let persisted = segments
+                        .backend_states
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    if persisted != configured_backups {
+                        return Err(Error::not_supported(format!(
+                            "backup membership changed for account {}",
+                            account_metadata.account
+                        )));
+                    }
+                }
+                bootstrap_account(
+                    metadata_provider.as_ref(),
+                    metadata_store.as_ref(),
+                    &account_metadata.account,
+                    &account_metadata.manifest,
+                )
+                .await?;
+            }
+        }
+        let runtime = MultiWriteRuntime::prepare(
+            metadata_store.clone(),
+            metadata_provider.clone(),
+            self.initial_partitions,
+            backup_names.clone(),
+            Some(self.primary_backend.clone()),
+            catch_up_targets,
+            self.checkpoint_interval,
+            metrics.clone(),
+        )
+        .await;
+        let primary = BackendEntry {
+            name: "primary".to_string(),
+            role: BackendRole::Primary,
+            backend: self.primary_backend,
+            raw_backend: self.primary_raw_backend,
+        };
+        let fs = MultiWriteWrappedFS {
+            inner: Arc::new(Inner {
+                primary,
+                runtime,
+                metrics: metrics.clone(),
+                ctx_resolver: self.ctx_resolver,
+            }),
+            metadata_store: metadata_store.clone(),
+        };
+        if protocol.status != ProtocolStatus::Stable {
+            let importer_primary: Arc<dyn FileSystem> = Arc::new(fs.clone());
+            let import_metrics = metrics.clone();
+            let import_store = metadata_store.clone();
+            let force_reset_import = reset_for_backup_change || reset_import_pending;
+            let importer = FullDataImporter::new(
+                importer_primary,
+                metadata_store,
+                metadata_provider,
+                self.initial_partitions,
+                backup_names,
+                self.reconcile_existing_data || force_reset_import,
+            );
+            let catch_up_full_scan =
+                force_reset_import.then(|| fs.inner.runtime.catch_up_full_scan_requester());
+            fs.inner.runtime.set_import_worker(async move {
+                let result = importer.run().await;
+                if let Err(error) = &result {
+                    tracing::error!(error = %error, "multi-write full-data import failed");
+                } else {
+                    if force_reset_import {
+                        import_store.clear_reset_import_pending().await?;
+                    }
+                    import_metrics.set_protocol_status(ProtocolStatus::Stable);
+                    if let Some(catch_up_full_scan) = &catch_up_full_scan {
+                        catch_up_full_scan.request();
+                    }
+                }
+                result
+            });
+        }
+        Ok(fs)
+    }
+}
+
+/// Previously initialized account metadata read during backup membership checks.
+struct ExistingAccountMetadata {
+    account: String,
+    manifest: PartitionsManifest,
+    segments: Vec<(ScopeKey, SegmentManifest)>,
+}
+
+/// Existing metadata snapshot and whether its backup names differ from config.
+struct ExistingMetadataScan {
+    accounts: Vec<ExistingAccountMetadata>,
+    membership_changed: bool,
+}
+
+impl ExistingMetadataScan {
+    /// Return how many partition scopes were read in this scan.
+    fn scope_count(&self) -> usize {
+        self.accounts
+            .iter()
+            .map(|account| account.segments.len())
+            .sum()
+    }
+}
+
+/// Clear provider runtime state for scopes that a reset full import can recreate.
+async fn reset_provider_scopes_for_current_accounts(
+    provider: &dyn MultiWriteProvider,
+    primary: &dyn FileSystem,
+    initial_partitions: u32,
+) -> Result<usize> {
+    let mut accounts = read_active_accounts(primary).await?;
+    accounts.insert(SYSTEM_DIR.to_string());
+    let mut scopes = 0;
+    for account_id in accounts {
+        for partition_id in 0..initial_partitions {
+            provider
+                .reset_scope(&ScopeKey {
+                    account_id: account_id.clone(),
+                    partition_id,
+                    epoch: 1,
+                })
+                .await?;
+            scopes += 1;
+        }
+    }
+    Ok(scopes)
+}
+
+/// Read existing metadata once and detect whether persisted backup names differ from config.
+async fn scan_existing_metadata(
+    metadata_store: &MetadataStore,
+    configured_backups: &BTreeSet<String>,
+) -> Result<ExistingMetadataScan> {
+    let mut accounts = Vec::new();
+    let mut membership_changed = false;
+    'accounts: for account in metadata_store.initialized_accounts().await? {
+        let path = metadata_store.paths().account_manifest(&account)?.0;
+        let manifest: PartitionsManifest = match metadata_store.read_json(&path).await {
+            Ok(manifest) => manifest,
+            Err(Error::NotFound(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        manifest.validate()?;
+        let mut segments_by_scope = Vec::new();
+        for &partition_id in manifest.partitions.keys() {
+            let path = metadata_store
+                .paths()
+                .segment_manifest(&account, partition_id)?
+                .0;
+            let segments: SegmentManifest = match metadata_store.read_json(&path).await {
+                Ok(segments) => segments,
+                Err(Error::NotFound(_)) => {
+                    tracing::warn!(
+                        account = %account,
+                        partition_id = partition_id,
+                        path = %path,
+                        "skip incomplete multi-write account metadata during startup"
+                    );
+                    continue 'accounts;
+                }
+                Err(error) => return Err(error),
+            };
+            segments.validate()?;
+            if segments
+                .backend_states
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != *configured_backups
+            {
+                membership_changed = true;
+            }
+            segments_by_scope.push((
+                ScopeKey {
+                    account_id: account.clone(),
+                    partition_id,
+                    epoch: manifest.epoch,
+                },
+                segments,
+            ));
+        }
+        accounts.push(ExistingAccountMetadata {
+            account,
+            manifest,
+            segments: segments_by_scope,
+        });
+    }
+    Ok(ExistingMetadataScan {
+        accounts,
+        membership_changed,
+    })
+}
+
+impl MultiWriteWrappedFS {
+    /// Start building a wrapper around the supplied primary filesystem.
+    pub fn builder(primary_backend: Arc<dyn FileSystem>) -> MultiWriteWrappedFSBuilder {
+        MultiWriteWrappedFSBuilder {
+            primary_backend,
+            primary_raw_backend: None,
+            backup_entries: Vec::new(),
+            metadata_store: None,
+            metadata_provider: None,
+            initial_partitions: 16,
+            checkpoint_interval: Duration::from_secs(86_400),
+            reconcile_existing_data: false,
+            ctx_resolver: Arc::new(DefaultFsContextResolver),
+        }
+    }
+
+    /// Release prepared runtime work after the wrapper becomes reachable.
+    pub(crate) fn activate(&self) {
+        self.inner.runtime.activate();
+    }
+
+    /// Return the raw primary backend for mount-level internal-name operations.
+    pub(crate) fn primary_raw_backend(&self) -> Option<Arc<dyn FileSystem>> {
+        self.inner.primary.raw_backend.clone()
+    }
+
+    /// Return whether the primary encryption wrapper owns PathLock acquisition.
+    pub(crate) fn encryption_handles_pathlock(&self) -> bool {
+        let any = self.inner.primary.backend.as_ref() as &dyn std::any::Any;
+        any.downcast_ref::<EncryptionWrappedFS>().is_some()
+    }
+
+    /// Return one while the flush worker is active and zero after it exits.
+    pub(crate) fn background_task_count(&self) -> usize {
+        usize::from(self.inner.runtime.is_running())
+    }
+
+    /// Return one V2 multi-write metrics snapshot without filesystem scans.
+    pub(crate) async fn metrics(&self) -> Result<Vec<RagfsMetric>> {
+        let protocol_status = self
+            .inner
+            .metrics
+            .protocol_status()
+            .unwrap_or(ProtocolStatus::Migrating);
+        let lag = self.inner.metrics.backend_lag();
+        let mut metrics = vec![
+            RagfsMetric {
+                name: "ragfs_multiwrite_background_tasks".into(),
+                labels: BTreeMap::new(),
+                value: RagfsMetricValue::Gauge(self.background_task_count() as f64),
+            },
+            RagfsMetric {
+                name: "ragfs_multiwrite_pending_events".into(),
+                labels: BTreeMap::new(),
+                value: RagfsMetricValue::Gauge(self.inner.runtime.pending_event_count() as f64),
+            },
+        ];
+        for (worker, label) in [
+            (MultiWriteWorker::Flush, "flush"),
+            (MultiWriteWorker::Checkpoint, "checkpoint"),
+            (MultiWriteWorker::CatchUp, "catch_up"),
+            (MultiWriteWorker::Gc, "gc"),
+        ] {
+            metrics.push(RagfsMetric::counter(
+                "ragfs_multiwrite_errors_total",
+                &[("worker", label)],
+                self.metadata_store.worker_error_count(worker),
+                1.0,
+            ));
+        }
+        metrics.push(RagfsMetric {
+            name: "ragfs_multiwrite_protocol_version".into(),
+            labels: BTreeMap::from([("version".into(), "v2".into())]),
+            value: RagfsMetricValue::Gauge(1.0),
+        });
+        for (status, value) in [
+            (
+                "migrating",
+                u64::from(protocol_status == ProtocolStatus::Migrating),
+            ),
+            (
+                "stable",
+                u64::from(protocol_status == ProtocolStatus::Stable),
+            ),
+        ] {
+            metrics.push(RagfsMetric {
+                name: "ragfs_multiwrite_protocol_status".into(),
+                labels: BTreeMap::from([("status".into(), status.into())]),
+                value: RagfsMetricValue::Gauge(value as f64),
+            });
+        }
+        metrics.extend(
+            lag.into_iter()
+                .map(|((backend, partition), value)| RagfsMetric {
+                    name: "ragfs_multiwrite_backend_lag_events".into(),
+                    labels: BTreeMap::from([
+                        ("backend".into(), backend),
+                        ("partition".into(), partition.to_string()),
+                    ]),
+                    value: RagfsMetricValue::Gauge(value as f64),
+                }),
+        );
+        Ok(metrics)
+    }
+
+    /// Resolve one account context and reject disagreement between path and task.
+    fn resolve_context(&self, path: &str) -> Result<FsContext> {
+        let path_ctx = self.inner.ctx_resolver.resolve(path)?;
+        match current_required_ctx() {
+            Ok(ctx) if !ctx.account_id().trim().is_empty() => {
+                if ctx.account_id() != path_ctx.account_id() {
+                    return Err(Error::invalid_path(format!(
+                        "path account '{}' conflicts with context account '{}'",
+                        path_ctx.account_id(),
+                        ctx.account_id()
+                    )));
+                }
+                Ok(ctx)
+            }
+            _ => Ok(path_ctx),
+        }
+    }
+
+    /// Build one canonical V2 event from a foreground mount-relative path.
+    fn pending_event(
+        &self,
+        path: &str,
+        kind: SegmentEventType,
+        destination_path: Option<&str>,
+    ) -> Result<Option<PendingEvent>> {
+        // Runtime lock files are primary-only and may sit outside an account root.
+        if destination_path.is_none()
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(is_hidden_runtime_lock_name)
+        {
+            return Ok(None);
+        }
+        let ctx = self.resolve_context(path)?;
+        let account_id = ctx.account_id().to_string();
+        let mut path = logical_path(&account_id, path)?;
+        let mut destination_path = destination_path
+            .map(|destination| logical_path(&account_id, destination))
+            .transpose()?;
+        let mut kind = kind;
+        let source_internal = is_multiwrite_internal_path(&path);
+        let destination_internal = destination_path
+            .as_deref()
+            .is_some_and(is_multiwrite_internal_path);
+        match (kind, source_internal, destination_internal) {
+            (SegmentEventType::MoveTree, true, false) => {
+                path = destination_path
+                    .take()
+                    .ok_or_else(|| Error::invalid_operation("move event requires a destination"))?;
+                kind = SegmentEventType::RemoveTree;
+            }
+            (SegmentEventType::MoveTree, false, true) => {
+                kind = SegmentEventType::RemoveTree;
+                destination_path = None;
+            }
+            (_, true, _) | (_, _, true) => return Ok(None),
+            _ => {}
+        }
+        Ok(Some(PendingEvent {
+            operation_id: Uuid::new_v4(),
+            account_id,
+            kind: PendingEventKind::Data(kind),
+            path,
+            destination_path,
+            route_hint: None,
+        }))
+    }
+
+    /// Submit one prebuilt event after its primary operation has succeeded.
+    fn submit_event(&self, event: Option<PendingEvent>) {
+        if let Some(event) = event {
+            self.inner.runtime.submit(event);
+        }
+    }
+
+    /// Copy raw primary bytes to another primary path and queue one write event.
+    pub async fn copy_within_primary(&self, src_path: &str, dst_path: &str) -> Result<bool> {
+        if normalize_prefix_path(src_path) == normalize_prefix_path(dst_path) {
+            return Ok(true);
+        }
+        let Some(primary_raw) = self.inner.primary.raw_backend.clone() else {
+            return Ok(false);
+        };
+        if !primary_raw.exists(src_path).await {
+            return Ok(false);
+        }
+        let ctx = self.resolve_context(src_path)?;
+        logical_path(ctx.account_id(), dst_path)?;
+        let event = self.pending_event(dst_path, SegmentEventType::Write, None)?;
+        copy_raw_primary_state(primary_raw, src_path, dst_path, &ctx).await?;
+        self.submit_event(event);
+        Ok(true)
+    }
+}
+
+/// Convert a wrapper path into one canonical account-owned logical path.
+fn logical_path(account_id: &str, path: &str) -> Result<String> {
+    let normalized = normalize_prefix_path(path);
+    let logical = if normalized.starts_with('/') {
+        format!("/local{normalized}")
+    } else {
+        format!("/local/{normalized}")
+    };
+    let account_root = format!("/local/{account_id}");
+    if logical != account_root
+        && !logical
+            .strip_prefix(&account_root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return Err(Error::invalid_path(format!(
+            "path does not belong to account '{account_id}': {logical}"
+        )));
+    }
+    Ok(logical)
+}
+
+/// Copy one complete raw file in bounded chunks under the request context.
+async fn copy_raw_primary_state(
+    primary_raw: Arc<dyn FileSystem>,
+    source_path: &str,
+    destination_path: &str,
+    ctx: &FsContext,
+) -> Result<()> {
+    FS_CTX
+        .scope(ctx.clone(), async {
+            let source = primary_raw.stat(source_path).await?;
+            if source.is_dir {
+                return Err(Error::IsADirectory(source_path.to_string()));
+            }
+            primary_raw
+                .ensure_parent_dirs(destination_path, 0o755)
+                .await?;
+            if source.size == 0 {
+                if primary_raw.exists(destination_path).await {
+                    return primary_raw.truncate(destination_path, 0).await;
+                }
+                return primary_raw.create(destination_path).await;
+            }
+            let mut offset = 0;
+            while offset < source.size {
+                let size = (source.size - offset).min(COPY_CHUNK_SIZE as u64);
+                let chunk = primary_raw.read(source_path, offset, size).await?;
+                if chunk.is_empty() {
+                    return Err(Error::internal(format!(
+                        "short read while copying raw primary file: {source_path}"
+                    )));
+                }
+                let flag = if offset == 0 {
+                    WriteFlag::Create
+                } else {
+                    WriteFlag::None
+                };
+                primary_raw
+                    .write(destination_path, &chunk, offset, flag)
+                    .await?;
+                offset += chunk.len() as u64;
+            }
+            Ok(())
+        })
+        .await
+}
+
+/// Build the V2 event specs required to represent one completed rename.
+fn rename_event_specs<'a>(
+    source: &FileInfo,
+    old_path: &'a str,
+    new_path: &'a str,
+) -> Vec<(SegmentEventType, &'a str, Option<&'a str>)> {
+    if source.is_dir {
+        vec![(SegmentEventType::MoveTree, old_path, Some(new_path))]
+    } else {
+        vec![
+            (SegmentEventType::Write, new_path, None),
+            (SegmentEventType::Remove, old_path, None),
+        ]
+    }
+}
+
+#[async_trait]
+impl FileSystem for MultiWriteWrappedFS {
+    /// Create a primary file and queue a write event after success.
+    async fn create(&self, path: &str) -> Result<()> {
+        let event = self.pending_event(path, SegmentEventType::Write, None)?;
+        self.inner.primary.backend.create(path).await?;
+        self.submit_event(event);
+        Ok(())
+    }
+
+    /// Create a primary directory without producing a file-state event.
+    async fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
+        self.inner.primary.backend.mkdir(path, mode).await
+    }
+
+    /// Remove a primary file and queue a remove event after success.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let event = self.pending_event(path, SegmentEventType::Remove, None)?;
+        self.inner.primary.backend.remove(path).await?;
+        self.submit_event(event);
+        Ok(())
+    }
+
+    /// Remove a primary tree and queue a directory removal event after success.
+    async fn remove_all(&self, path: &str) -> Result<()> {
+        let event = self
+            .pending_event(path, SegmentEventType::RemoveTree, None)?
+            .map(|mut event| {
+                if event.path == format!("/local/{}", event.account_id) {
+                    event.kind = PendingEventKind::DeleteAccount;
+                }
+                event
+            });
+        let is_delete_account = event
+            .as_ref()
+            .is_some_and(|event| matches!(event.kind, PendingEventKind::DeleteAccount));
+        match self.inner.primary.backend.remove_all(path).await {
+            Ok(()) => {
+                self.submit_event(event);
+                Ok(())
+            }
+            Err(error @ Error::NotFound(_)) if is_delete_account => {
+                self.submit_event(event);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read bytes directly from the primary backend.
+    async fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.inner.primary.backend.read(path, offset, size).await
+    }
+
+    /// Write primary bytes and queue a write event after success.
+    async fn write(&self, path: &str, data: &[u8], offset: u64, flags: WriteFlag) -> Result<u64> {
+        let event = self.pending_event(path, SegmentEventType::Write, None)?;
+        let written = self
+            .inner
+            .primary
+            .backend
+            .write(path, data, offset, flags)
+            .await?;
+        self.submit_event(event);
+        Ok(written)
+    }
+
+    /// List one directory directly from the primary backend.
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<ListSortBy>,
+        sort_order: Option<SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
+        self.inner
+            .primary
+            .backend
+            .read_dir(path, offset, limit, sort_by, sort_order)
+            .await
+    }
+
+    /// List internal entries directly from the primary backend.
+    async fn read_internal_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
+        self.inner.primary.backend.read_internal_dir(path).await
+    }
+
+    /// Read metadata directly from the primary backend.
+    async fn stat(&self, path: &str) -> Result<FileInfo> {
+        self.inner.primary.backend.stat(path).await
+    }
+
+    /// Rename a primary path and queue file or tree events after success.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let old_ctx = self.resolve_context(old_path)?;
+        let new_ctx = self.resolve_context(new_path)?;
+        if old_ctx.account_id() != new_ctx.account_id() {
+            return Err(Error::invalid_path(format!(
+                "rename paths cross accounts: '{}' -> '{}'",
+                old_path, new_path
+            )));
+        }
+        let source = self.inner.primary.backend.stat(old_path).await?;
+        let events = rename_event_specs(&source, old_path, new_path)
+            .into_iter()
+            .map(|(kind, path, destination)| self.pending_event(path, kind, destination))
+            .collect::<Result<Vec<_>>>()?;
+        self.inner
+            .primary
+            .backend
+            .rename(old_path, new_path)
+            .await?;
+        for event in events {
+            self.submit_event(event);
+        }
+        Ok(())
+    }
+
+    /// Change primary permissions and queue a write event after success.
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let event = self.pending_event(path, SegmentEventType::Write, None)?;
+        self.inner.primary.backend.chmod(path, mode).await?;
+        self.submit_event(event);
+        Ok(())
+    }
+
+    /// Truncate a primary file and queue a write event after success.
+    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        let event = self.pending_event(path, SegmentEventType::Write, None)?;
+        self.inner.primary.backend.truncate(path, size).await?;
+        self.submit_event(event);
+        Ok(())
+    }
+
+    /// Create primary parent directories without producing a file-state event.
+    async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> Result<()> {
+        self.inner
+            .primary
+            .backend
+            .ensure_parent_dirs(path, mode)
+            .await
+    }
+
+    /// Search content directly on the primary backend.
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<GrepResult> {
+        self.inner
+            .primary
+            .backend
+            .grep(path, pattern, options)
+            .await
+    }
+
+    /// Traverse a tree directly on the primary backend.
+    async fn tree_directory(
+        &self,
+        path: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<ListSortBy>,
+        sort_order: Option<SortOrder>,
+        directories_only: bool,
+    ) -> Result<Vec<TreeEntry>> {
+        self.inner
+            .primary
+            .backend
+            .tree_directory(
+                path,
+                show_hidden,
+                node_limit,
+                level_limit,
+                offset,
+                sort_by,
+                sort_order,
+                directories_only,
+            )
+            .await
+    }
+
+    /// Match paths directly on the primary backend.
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        self.inner
+            .primary
+            .backend
+            .glob_directory(
+                path,
+                pattern,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/test_multibackend_wrapper.rs"]
+mod tests;

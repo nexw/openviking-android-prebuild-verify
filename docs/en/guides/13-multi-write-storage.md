@@ -1,0 +1,115 @@
+# Multi-Write Storage Guide
+
+V2 multi-write returns after the primary succeeds and updates metadata and
+backups asynchronously. The primary is the only direct read source.
+
+## Minimal Configuration
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "backups": {
+        "initial_partitions": 16,
+        "checkpoint_interval_secs": 86400,
+        "reconcile_existing_data": false,
+        "provider": "filesystem",
+        "items": [
+          {
+            "name": "local-backup",
+            "backend": "local",
+            "params": {
+              "workspace": "./data/backup"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+The top-level V2 settings are:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `initial_partitions` | `16` | Metadata partitions created for an account |
+| `checkpoint_interval_secs` | `86400` | Checkpoint discovery interval; minimum `60` |
+| `reconcile_existing_data` | `false` | Scan existing primary files and record them in V2 metadata |
+| `provider` | `"filesystem"` | Metadata segment provider: `filesystem` or `cache` |
+
+Each `items[]` entry needs `name`, `backend`, and backend-specific `params`.
+`encryption` is optional. Backup names must be unique and cannot be
+`primary`.
+
+When `provider` is `cache`, multi-write reuses the top-level CacheRuntime.
+The top-level `cache.provider` selects the implementation; multi-write has no
+separate Cache Provider connection.
+
+The Python configuration layer still accepts legacy V1 sync, acknowledgement,
+retry, operation, exclude, and redirect fields. It warns and removes them
+before calling Rust; the fields have no effect.
+
+## Runtime Behavior
+
+- The primary is the only direct read source and business source of truth.
+- Primary success returns without waiting for metadata or backups.
+- Multi-write metadata is stored only on the primary.
+- Backups converge in the background.
+- There is no synchronization status or manual retry API or CLI command.
+
+A crash between primary success and event persistence can lose one replication
+event. Rebuild an affected backup from the primary.
+
+## Partition Count
+
+`initial_partitions` applies only when an account's partition manifest is first
+created. Existing accounts continue to use their persisted partition count and
+routes after configuration changes. Partition expansion and shrinking are not
+supported in this release.
+
+## First Enable And Rollback
+
+When `.multiwrite.json` is absent, the mount starts foreground V2 event
+submission and initializes V2 metadata. If `reconcile_existing_data=true`,
+startup also scans current primary files and records them in V2 metadata. Extra
+old files on backups are not removed.
+
+With the default `reconcile_existing_data=false`, files that already existed on
+the primary are not recorded as V2 write events. Use this only when backups are
+already aligned with the primary or historical backfill is intentionally skipped.
+
+Old multi-write protocols and old migration fields are rejected. Take a
+complete backup before enabling multi-write. Restore that backup before
+rolling back the binary.
+
+## Backup Configuration Changes
+
+When configured backup names differ from persisted `backend_states`, startup
+resets V2 multi-write metadata and runs a full import of current primary files.
+This path covers added, removed, and renamed backups.
+
+Changing backup configuration rescans current primary files and drives backup
+catch-up. This adds storage I/O, so foreground IOPS can increase. Run this in a
+maintenance window and avoid application writes during the change.
+
+Reset and full import enumerate only files that still exist on the primary.
+They do not preserve delete or move history from old segments. If a retained
+backup already contains old files that no longer exist on the primary, those
+files can remain on the backup after the change. If writes, deletes, or moves
+happen during the change, backups can also retain a small amount of dirty data,
+mostly old paths or old file versions.
+
+## Verification
+
+Use normal file APIs to verify primary reads and writes. Use the metrics in
+[Metrics](../concepts/12-metrics.md) to monitor queue depth, worker failures,
+backup lag, protocol version, and protocol status.
+
+## Related Documents
+
+- [Multi-Write Storage](../concepts/14-multi-write-storage.md)
+- [Configuration Guide](./01-configuration.md)
+- [OVPack Import and Export](./09-ovpack.md)
