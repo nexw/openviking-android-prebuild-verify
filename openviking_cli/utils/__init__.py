@@ -1,0 +1,26 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Utility functions and helpers."""
+
+from openviking_cli.utils.async_utils import run_async
+from openviking_cli.utils.logger import default_logger, get_logger
+from openviking_cli.utils.uri import VikingURI
+
+__all__ = [
+    "VikingURI",
+    "get_logger",
+    "default_logger",
+    "StructuredLLM",
+    "parse_json_from_response",
+    "parse_json_to_model",
+    "run_async",
+]
+
+
+def __getattr__(name):
+    # Importing logging must not initialize the application configuration through LLM helpers.
+    if name in {"StructuredLLM", "parse_json_from_response", "parse_json_to_model"}:
+        from openviking_cli.utils import llm
+
+        return getattr(llm, name)
+    raise AttributeError(name)
