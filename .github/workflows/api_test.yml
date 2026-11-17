@@ -54,7 +54,7 @@ jobs:
           docker run --rm --network none \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             ubuntu:24.04 chown -hR "$(id -u):$(id -g)" /workspace
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: plan
@@ -135,7 +135,7 @@ jobs:
             -o Acquire::Retries=2 -o Acquire::https::Timeout=20 \
             install -y --no-install-recommends \
             "${packages[@]}"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -256,7 +256,7 @@ jobs:
           apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
             -o Acquire::Retries=2 install -y --no-install-recommends \
             "${packages[@]}"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/linux-test-env
@@ -355,7 +355,7 @@ jobs:
           apt-get -o Acquire::https::CaInfo=/tmp/runner-ca-certificates.crt \
             -o Acquire::Retries=2 install -y --no-install-recommends \
             "${packages[@]}"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 100

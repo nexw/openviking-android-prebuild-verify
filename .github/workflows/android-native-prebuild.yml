@@ -84,7 +84,7 @@ jobs:
       # ccache is picked up by Cargo (cc-rs) and by the CMake build below.
       CCACHE_MAXSIZE: 512M
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # setuptools_scm derives the version from tags.
           fetch-depth: 0

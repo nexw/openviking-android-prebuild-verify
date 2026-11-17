@@ -25,7 +25,7 @@ jobs:
     steps:
       - name: Set kubeconfig path
         run: echo "OV_TEST_KIND_KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
