@@ -75,7 +75,7 @@ jobs:
             --hermes-root "$PWD" \
             --output-dir "$RUNNER_TEMP/hermes-plugin-install"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: hermes-plugin-install-logs
@@ -168,7 +168,7 @@ jobs:
           if [ '${{ matrix.host }}' = release ]; then ARGS+=(--legacy-uv); fi
           "$HERMES_PYTHON" "$GITHUB_WORKSPACE/scripts/check-hermes-quick-local.py" \
             --hermes-root "$PWD" --output-dir "$RUNNER_TEMP/quick-local" "${ARGS[@]}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: quick-local-${{ matrix.os }}-${{ matrix.host }}

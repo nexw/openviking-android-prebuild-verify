@@ -66,7 +66,7 @@ jobs:
         run: |
           kind export logs artifacts/kind --name ovgw-e2e || true
           kubectl --kubeconfig "$OV_TEST_KIND_KUBECONFIG" get pods -A -o wide > artifacts/pods.txt || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gateway-kind-evidence
