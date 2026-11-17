@@ -41,7 +41,7 @@ jobs:
           path: .ci/hermes-agent
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
 
@@ -111,7 +111,7 @@ jobs:
           ref: ${{ matrix.hermes_ref || 'db44c46208f1b421b4ecb7e56bf9d68b0423906f' }}
           path: .ci/hermes-agent
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python || '3.14' }}
       - uses: astral-sh/setup-uv@v7
