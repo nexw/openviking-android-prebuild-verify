@@ -21,7 +21,10 @@ import type { FileBrowserActionBarLabels } from '../../components/file-browser-a
 import type { FileBrowserExperienceDataSource } from './experience-data-source.js';
 import type { FileBrowserDashboard } from './dashboard-model.js';
 import type { FilePreviewLabels } from '../../components/file-preview/index.js';
-import type { FileTreeLabels } from '../../components/file-tree/index.js';
+import type {
+  FileTreeEntryRow,
+  FileTreeLabels,
+} from '../../components/file-tree/index.js';
 import type { OvRequestOptions } from '../../client/index.js';
 import type {
   FileBrowserAclLabels,
@@ -158,6 +161,10 @@ export interface FileBrowserLabels {
   l0Summary?: string;
   /** 目录预览的 L1 总览页签。The L1 overview tab of a directory preview. */
   l1Overview?: string;
+  /** L0 摘要为空时的提示。Message shown when the L0 summary is absent. */
+  emptyL0Summary?: string;
+  /** L1 总览为空时的提示。Message shown when the L1 overview is absent. */
+  emptyL1Overview?: string;
   /** 目录某一级摘要尚未生成时的提示。Message shown when a summary level is empty. */
   summaryEmpty?: string;
   /**
@@ -279,6 +286,8 @@ export interface FileBrowserProps extends Omit<
    * pane.
    */
   onUriChange?: (uri: string | null) => void;
+  /** 用户选中目录树条目时触发，包含重复选中。Reports a tree entry selection, including reselecting the same row. */
+  onSelect?: (row: FileTreeEntryRow) => void;
   /** Host gateway/view override; nullish values retain the native dashboard. */
   renderDashboard?: (dashboard: FileBrowserDashboard) => ReactNode;
   /**
